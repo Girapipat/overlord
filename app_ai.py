@@ -1,24 +1,21 @@
-from flask import Flask, render_template, request, jsonify
-import tensorflow as tf
+from flask import Flask, request, jsonify, render_template
 import numpy as np
 from PIL import Image
+import io, os
+import tensorflow as tf
 
 app = Flask(__name__)
 
-# โหลดโมเดล
-model_class = tf.keras.models.load_model("classifier_model.h5")
-model_reg = tf.keras.models.load_model("regression_model.h5", compile=False)
+# ✅ โหลด TFLite Model
+TFLITE_PATH = "classifier_model.tflite"
+interpreter = tf.lite.Interpreter(model_path=TFLITE_PATH)
+interpreter.allocate_tensors()
+
+# ดึง input/output details
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
 
 IMG_SIZE = (224, 224)
-THRESHOLD = 0.6              # ความมั่นใจขั้นต่ำที่ถือว่า "ใช่สารละลาย"
-INTENSITY_MIN = 10           # ความเข้มข้นขั้นต่ำที่ถือว่าเป็นสารละลายจริง
-
-def prepare_image(image_file):
-    img = Image.open(image_file).convert("RGB")
-    img = img.resize(IMG_SIZE)
-    img_array = np.array(img) / 255.0
-    img_array = np.expand_dims(img_array, axis=0)
-    return img_array
 
 @app.route("/")
 def index():
@@ -27,46 +24,34 @@ def index():
 @app.route("/upload", methods=["POST"])
 def upload():
     if "file" not in request.files:
-        return jsonify({"error": "ไม่พบไฟล์ภาพ"})
+        return jsonify({"error": "ไม่มีไฟล์ที่อัปโหลด"}), 400
 
     file = request.files["file"]
     if file.filename == "":
-        return jsonify({"error": "ยังไม่ได้เลือกไฟล์"})
+        return jsonify({"error": "ไม่ได้เลือกไฟล์"}), 400
 
     try:
-        img = prepare_image(file)
+        # โหลดและแปลงภาพ
+        image = Image.open(io.BytesIO(file.read())).convert("RGB")
+        image = image.resize(IMG_SIZE)
+        img_array = np.expand_dims(np.array(image, dtype=np.float32) / 255.0, axis=0)
 
-        # ขั้นที่ 1: ทำนายว่าเป็นสารละลายหรือไม่
-        prob = float(model_class.predict(img)[0][0])  # 0.0–1.0 จาก sigmoid
+        # รันผ่าน TFLite
+        interpreter.set_tensor(input_details[0]["index"], img_array)
+        interpreter.invoke()
+        pred = interpreter.get_tensor(output_details[0]["index"])[0][0]
 
-        if prob >= THRESHOLD:
-            # ขั้นที่ 2: ทำนายค่าความเข้มข้น
-            pred_value = float(model_reg.predict(img)[0][0])
-            intensity = int(pred_value * 255 / 0.9)
-            intensity = max(0, min(intensity, 255))
+        confidence = float(pred)
+        is_solution = confidence > 0.5
+        intensity = int(np.mean(img_array) * 255)
 
-            # ตรวจสอบว่าเข้มข้นต่ำผิดปกติหรือไม่
-            if intensity < INTENSITY_MIN:
-                return jsonify({
-                    "is_solution": False,
-                    "confidence": round(prob, 2),
-                    "intensity": intensity,
-                    "note": "ค่าความเข้มข้นต่ำเกินไป"
-                })
-
-            return jsonify({
-                "is_solution": True,
-                "confidence": round(prob, 2),
-                "intensity": intensity
-            })
-        else:
-            return jsonify({
-                "is_solution": False,
-                "confidence": round(prob, 2)
-            })
-
+        return jsonify({
+            "is_solution": is_solution,
+            "confidence": confidence,
+            "intensity": intensity
+        })
     except Exception as e:
-        return jsonify({"error": str(e)})
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
